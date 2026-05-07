@@ -12,9 +12,6 @@ use Illuminate\View\View;
 
 class ProfileController extends Controller
 {
-    /**
-     * Display the user's profile form.
-     */
     public function edit(Request $request): View
     {
         return view('profile.edit', [
@@ -22,39 +19,50 @@ class ProfileController extends Controller
         ]);
     }
 
-    /**
-     * Update the user's profile information.
-     */
     public function update(ProfileUpdateRequest $request): RedirectResponse
     {
-        $request->user()->fill($request->validated());
+        $user = $request->user();
 
-        if ($request->user()->isDirty('email')) {
-            $request->user()->email_verified_at = null;
+        $user->fill($request->validated());
+
+        if ($user->isDirty('email')) {
+            $user->email_verified_at = null;
         }
 
-        $request->user()->save();
+        // Handle foto profile dari form edit
+        if ($request->hasFile('photo')) {
+            // Hapus foto lama
+            if ($user->profile_photo && Storage::disk('public')->exists($user->profile_photo)) {
+                Storage::disk('public')->delete($user->profile_photo);
+            }
+
+            // Simpan foto baru
+            $path = $request->file('photo')->store('profiles', 'public');
+            $user->profile_photo = $path;
+        }
+
+        $user->save();
 
         return Redirect::route('profile.edit')->with('status', 'profile-updated');
     }
 
     /**
-     * Upload profile photo via AJAX.
+     * Upload foto profile via AJAX (dari dashboard)
      */
     public function uploadPhoto(Request $request)
     {
         $request->validate([
-            'photo' => 'required|image|mimes:jpeg,png,jpg,gif,webp|max:2048',
+            'photo' => ['required', 'image', 'mimes:jpg,jpeg,png,webp', 'max:2048'],
         ]);
 
         $user = $request->user();
 
-        // Delete old photo if exists
+        // Hapus foto lama jika ada
         if ($user->profile_photo && Storage::disk('public')->exists($user->profile_photo)) {
             Storage::disk('public')->delete($user->profile_photo);
         }
 
-        // Store new photo
+        // Simpan foto baru ke storage/app/public/profiles
         $path = $request->file('photo')->store('profiles', 'public');
         $user->profile_photo = $path;
         $user->save();
@@ -65,9 +73,6 @@ class ProfileController extends Controller
         ]);
     }
 
-    /**
-     * Delete the user's account.
-     */
     public function destroy(Request $request): RedirectResponse
     {
         $request->validateWithBag('userDeletion', [
@@ -76,8 +81,12 @@ class ProfileController extends Controller
 
         $user = $request->user();
 
-        Auth::logout();
+        // Hapus foto profile saat delete akun
+        if ($user->profile_photo && Storage::disk('public')->exists($user->profile_photo)) {
+            Storage::disk('public')->delete($user->profile_photo);
+        }
 
+        Auth::logout();
         $user->delete();
 
         $request->session()->invalidate();

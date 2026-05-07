@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\PeriodDay;
 use Illuminate\Http\Request;
 use Carbon\Carbon;
 
@@ -11,9 +12,7 @@ class CycleController extends Controller
     {
         $user = auth()->user();
         $latestCycle = $user->menstrualCycles()->latest('start_date')->first();
-        $allCycles = $user->menstrualCycles()->orderBy('start_date', 'desc')->get();
 
-        // Defaults
         $nextPeriodDate = null;
         $fertileWindowStart = null;
         $fertileWindowEnd = null;
@@ -24,55 +23,29 @@ class CycleController extends Controller
         $lastPeriodDateFormatted = null;
         $cycleLength = 28;
         $periodDays = 5;
-        
+
         if ($latestCycle) {
             $cycleLength = (int) $latestCycle->cycle_length;
-            $periodDays = $latestCycle->end_date 
-                ? (int) Carbon::parse($latestCycle->start_date)->diffInDays(Carbon::parse($latestCycle->end_date)) + 1 
+            $periodDays = $latestCycle->end_date
+                ? (int) Carbon::parse($latestCycle->start_date)->diffInDays(Carbon::parse($latestCycle->end_date)) + 1
                 : 5;
-            
+
             $today = now()->startOfDay();
             $startDate = Carbon::parse($latestCycle->start_date)->startOfDay();
             $lastPeriodDateFormatted = $startDate->translatedFormat('d F Y');
-            
-            // Next period date
+
             $nextPeriodDate = $startDate->copy()->addDays($cycleLength);
-            
-            // If nextPeriodDate is in the past, advance to the next occurrence
-            while ($nextPeriodDate->copy()->startOfDay()->lt($today) && $today->diffInDays($nextPeriodDate) > 0) {
-                $nextPeriodDate->addDays($cycleLength);
-            }
-            
-            // Calculate which cycle we're in relative to the start
             $totalDaysSinceStart = (int) $startDate->diffInDays($today);
-            
-            // Current day in the current cycle (modulo cycleLength, but at least 1)
             $currentDay = ($totalDaysSinceStart % $cycleLength) + 1;
-            
-            // If we're exactly at the start of a new cycle
-            if ($currentDay > $cycleLength) {
-                $currentDay = 1;
-            }
-            
-            // Ensure currentDay is always valid (never negative or zero)
             $currentDay = max(1, min($currentDay, $cycleLength));
-            
-            // Ovulation is 14 days before next period
+
             $ovulationDay = $cycleLength - 14;
-            $ovulationDate = $startDate->copy()->addDays((ceil($totalDaysSinceStart / $cycleLength) * $cycleLength) + $ovulationDay - 1);
-            
-            // Recalculate ovulation based on the current cycle's start
             $currentCycleStart = $startDate->copy()->addDays(floor($totalDaysSinceStart / $cycleLength) * $cycleLength);
             $ovulationDate = $currentCycleStart->copy()->addDays($ovulationDay - 1);
-            
-            // Fertile window: 5 days before ovulation to 1 day after
             $fertileWindowStart = $ovulationDate->copy()->subDays(5);
             $fertileWindowEnd = $ovulationDate->copy()->addDays(1);
-            
-            // Next period date from current cycle
             $nextPeriodDate = $currentCycleStart->copy()->addDays($cycleLength);
-            
-            // Determine current phase based on currentDay
+
             if ($currentDay <= $periodDays) {
                 $currentPhaseName = 'Fase Menstruasi';
                 $currentPhaseDesc = 'Lapisan rahim meluruh. Wajar jika terasa kram perut, nyeri punggung, dan perubahan mood.';
@@ -92,27 +65,14 @@ class CycleController extends Controller
                 $currentPhaseDesc = 'Masa pra-haid (PMS). Kamu mungkin merasa lebih sensitif, kembung, atau mudah lelah.';
             }
         }
-        
-        // Calculate progress percentage
+
         $progressPercent = $latestCycle ? min(100, max(0, (($currentDay - 1) / $cycleLength) * 100)) : 0;
-        
-        // Days to next period
         $daysToNext = $nextPeriodDate ? (int) now()->startOfDay()->diffInDays($nextPeriodDate->copy()->startOfDay(), false) : 0;
 
         return view('dashboard', compact(
-            'latestCycle',
-            'nextPeriodDate',
-            'fertileWindowStart',
-            'fertileWindowEnd',
-            'ovulationDate',
-            'currentPhaseName',
-            'currentPhaseDesc',
-            'currentDay',
-            'progressPercent',
-            'daysToNext',
-            'lastPeriodDateFormatted',
-            'cycleLength',
-            'periodDays'
+            'latestCycle', 'nextPeriodDate', 'fertileWindowStart', 'fertileWindowEnd',
+            'ovulationDate', 'currentPhaseName', 'currentPhaseDesc', 'currentDay',
+            'progressPercent', 'daysToNext', 'lastPeriodDateFormatted', 'cycleLength', 'periodDays'
         ));
     }
 
@@ -123,9 +83,7 @@ class CycleController extends Controller
             'end_date' => 'nullable|date|after_or_equal:start_date',
             'cycle_length' => 'required|integer|min:20|max:45'
         ]);
-
         auth()->user()->menstrualCycles()->create($request->all());
-
         return redirect()->route('dashboard')->with('success', 'Siklus berhasil ditambahkan.');
     }
 
@@ -134,73 +92,195 @@ class CycleController extends Controller
         return view('calendar');
     }
 
+    // ─── TOGGLE PERIOD DAY (MANUAL) ───────────────────────────────────────────
+    public function togglePeriodDay(Request $request)
+    {
+        $request->validate([
+            'date' => 'required|date',
+            'flow_intensity' => 'nullable|string|in:spotting,light,medium,heavy',
+        ]);
+
+        $user = auth()->user();
+        $existing = $user->periodDays()->where('date', $request->date)->first();
+
+        if ($existing) {
+            $existing->delete();
+            $this->syncCycleFromPeriodDays($user, $request->date);
+            return response()->json(['success' => true, 'action' => 'removed']);
+        }
+
+        $day = $user->periodDays()->create([
+            'date' => $request->date,
+            'flow_intensity' => $request->flow_intensity ?? 'medium',
+        ]);
+        $this->syncCycleFromPeriodDays($user, $request->date);
+        return response()->json(['success' => true, 'action' => 'added', 'day' => $day]);
+    }
+
+    // ─── UPDATE FLOW INTENSITY ────────────────────────────────────────────────
+    public function updatePeriodDayFlow(Request $request)
+    {
+        $request->validate([
+            'date' => 'required|date',
+            'flow_intensity' => 'required|string|in:spotting,light,medium,heavy',
+        ]);
+
+        $user = auth()->user();
+        $day = $user->periodDays()->updateOrCreate(
+            ['date' => $request->date],
+            ['flow_intensity' => $request->flow_intensity]
+        );
+
+        $this->syncCycleFromPeriodDays($user, $request->date);
+        return response()->json(['success' => true, 'day' => $day]);
+    }
+
+    // ─── SYNC: period_days → menstrual_cycles ─────────────────────────────────
+    private function syncCycleFromPeriodDays($user, string $dateStr): void
+    {
+        // Get all period days sorted
+        $allDates = $user->periodDays()
+            ->orderBy('date')
+            ->pluck('date')
+            ->map(fn($d) => Carbon::parse($d)->toDateString())
+            ->values()
+            ->toArray();
+
+        // Group into consecutive clusters
+        $clusters = [];
+        $current = [];
+        foreach ($allDates as $d) {
+            if (empty($current)) {
+                $current = [$d];
+            } else {
+                $prev = Carbon::parse(end($current));
+                $curr = Carbon::parse($d);
+                if ($curr->diffInDays($prev) === 1) {
+                    $current[] = $d;
+                } else {
+                    $clusters[] = $current;
+                    $current = [$d];
+                }
+            }
+        }
+        if (!empty($current)) $clusters[] = $current;
+
+        // Find which cluster $dateStr belongs to
+        $targetCluster = null;
+        foreach ($clusters as $cluster) {
+            if (in_array($dateStr, $cluster)) {
+                $targetCluster = $cluster;
+                break;
+            }
+        }
+
+        if (!$targetCluster) {
+            // Day was removed and no cluster → clean up orphan cycle records near this date
+            $user->menstrualCycles()
+                ->where(function ($q) use ($dateStr) {
+                    $q->where('start_date', $dateStr)
+                      ->orWhere('end_date', $dateStr);
+                })->delete();
+            return;
+        }
+
+        $start = $targetCluster[0];
+        $end   = end($targetCluster);
+
+        // Calculate cycle_length from gap with previous cluster
+        $clusterIndex = array_search($targetCluster, $clusters);
+        $prevCycleLength = 28;
+        if ($clusterIndex > 0) {
+            $prevCluster = $clusters[$clusterIndex - 1];
+            $gap = Carbon::parse($prevCluster[0])->diffInDays(Carbon::parse($start));
+            $prevCycleLength = max(20, min(45, (int) $gap));
+        }
+
+        // Upsert: find nearby cycle and update, or create
+        $existingCycle = $user->menstrualCycles()
+            ->whereBetween('start_date', [
+                Carbon::parse($start)->subDays(3)->toDateString(),
+                Carbon::parse($start)->addDays(3)->toDateString(),
+            ])->first();
+
+        if ($existingCycle) {
+            $existingCycle->update([
+                'start_date'   => $start,
+                'end_date'     => $end,
+                'cycle_length' => $prevCycleLength,
+            ]);
+        } else {
+            $user->menstrualCycles()->create([
+                'start_date'   => $start,
+                'end_date'     => $end,
+                'cycle_length' => $prevCycleLength,
+            ]);
+        }
+    }
+
+    // ─── GET CYCLES (AJAX) ────────────────────────────────────────────────────
     public function getCycles()
     {
-        $cycles = auth()->user()->menstrualCycles()->orderBy('start_date', 'asc')->get();
-        $symptoms = auth()->user()->symptomLogs()->get()->keyBy(function($item) {
-            return $item->log_date->format('Y-m-d');
-        });
+        $user = auth()->user();
+        $cycles = $user->menstrualCycles()->orderBy('start_date')->get();
+        $periodDays = $user->periodDays()->orderBy('date')->get();
+        $symptoms = $user->symptomLogs()->get()->keyBy(fn($s) => $s->log_date->format('Y-m-d'));
 
-        // Calculate predictions for next 3 cycles
-        $latest = $cycles->last();
+        // Predictions based on latest cycle
         $predictions = [];
+        $latest = $cycles->last();
         if ($latest) {
-            $periodDays = $latest->end_date 
-                ? Carbon::parse($latest->start_date)->diffInDays(Carbon::parse($latest->end_date)) + 1 
+            $periodLen = $latest->end_date
+                ? Carbon::parse($latest->start_date)->diffInDays($latest->end_date) + 1
                 : 5;
-            $cycleLength = $latest->cycle_length;
-            
+            $cycleLen = $latest->cycle_length;
+
             for ($i = 1; $i <= 3; $i++) {
-                $nextStart = Carbon::parse($latest->start_date)->addDays($cycleLength * $i);
-                $ovulationDay = $cycleLength - 14;
-                $ovulation = $nextStart->copy()->addDays($ovulationDay - 1);
-                $fertileStart = $ovulation->copy()->subDays(5);
-                $fertileEnd = $ovulation->copy()->addDays(1);
-                
+                $nextStart = Carbon::parse($latest->start_date)->addDays($cycleLen * $i);
+                $ovulDay   = $cycleLen - 14;
+                $ovulation = $nextStart->copy()->addDays($ovulDay - 1);
                 $predictions[] = [
-                    'start_date' => $nextStart->toDateString(),
-                    'end_date' => $nextStart->copy()->addDays($periodDays - 1)->toDateString(),
-                    'period_days' => $periodDays,
+                    'start_date'     => $nextStart->toDateString(),
+                    'end_date'       => $nextStart->copy()->addDays($periodLen - 1)->toDateString(),
                     'ovulation_date' => $ovulation->toDateString(),
-                    'fertile_start' => $fertileStart->toDateString(),
-                    'fertile_end' => $fertileEnd->toDateString(),
+                    'fertile_start'  => $ovulation->copy()->subDays(5)->toDateString(),
+                    'fertile_end'    => $ovulation->copy()->addDays(1)->toDateString(),
                 ];
             }
         }
-        
+
         return response()->json([
-            'cycles' => $cycles,
-            'symptoms' => $symptoms,
-            'predictions' => $predictions
+            'cycles'      => $cycles,
+            'period_days' => $periodDays,
+            'symptoms'    => $symptoms,
+            'predictions' => $predictions,
         ]);
     }
 
     public function storeAjax(Request $request)
     {
         $request->validate([
-            'start_date' => 'required|date',
+            'start_date'    => 'required|date',
             'period_length' => 'nullable|integer|min:1|max:14',
-            'cycle_length' => 'nullable|integer|min:20|max:45',
+            'cycle_length'  => 'nullable|integer|min:20|max:45',
         ]);
-        
-        $periodLength = $request->period_length ?? 5;
-        $cycleLength = $request->cycle_length ?? 28;
 
-        // Find existing cycle to avoid duplicates
+        $periodLength = $request->period_length ?? 5;
+        $cycleLength  = $request->cycle_length ?? 28;
+
         $exists = auth()->user()->menstrualCycles()->where('start_date', $request->start_date)->first();
         if ($exists) {
-            // Update existing instead of error
             $exists->update([
-                'end_date' => Carbon::parse($request->start_date)->addDays($periodLength - 1)->toDateString(),
+                'end_date'     => Carbon::parse($request->start_date)->addDays($periodLength - 1)->toDateString(),
                 'cycle_length' => $cycleLength,
             ]);
             return response()->json(['success' => true, 'cycle' => $exists, 'updated' => true]);
         }
 
         $cycle = auth()->user()->menstrualCycles()->create([
-            'start_date' => $request->start_date,
-            'end_date' => Carbon::parse($request->start_date)->addDays($periodLength - 1)->toDateString(), 
-            'cycle_length' => $cycleLength
+            'start_date'   => $request->start_date,
+            'end_date'     => Carbon::parse($request->start_date)->addDays($periodLength - 1)->toDateString(),
+            'cycle_length' => $cycleLength,
         ]);
 
         return response()->json(['success' => true, 'cycle' => $cycle]);
@@ -209,13 +289,13 @@ class CycleController extends Controller
     public function storeSymptomAjax(Request $request)
     {
         $request->validate([
-            'log_date' => 'required|date',
+            'log_date'       => 'required|date',
             'flow_intensity' => 'nullable|string',
-            'pain_level' => 'nullable|integer|min:1|max:5',
-            'mood' => 'nullable|string',
-            'fatigue' => 'nullable|integer|min:1|max:5',
-            'emotions' => 'nullable|string',
-            'notes' => 'nullable|string|max:500',
+            'pain_level'     => 'nullable|integer|min:1|max:5',
+            'mood'           => 'nullable|string',
+            'fatigue'        => 'nullable|integer|min:1|max:5',
+            'emotions'       => 'nullable|string',
+            'notes'          => 'nullable|string|max:500',
         ]);
 
         $symptom = auth()->user()->symptomLogs()->updateOrCreate(

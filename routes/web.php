@@ -25,6 +25,9 @@ Route::middleware(['auth', 'verified'])->group(function () {
     Route::post('/api/symptoms', [CycleController::class, 'storeSymptomAjax']);
     Route::get('/api/symptoms', [CycleController::class, 'getSymptomHistory']);
     Route::post('/api/profile/photo', [ProfileController::class, 'uploadPhoto']);
+    // Manual period day toggling
+    Route::post('/api/period-days/toggle', [CycleController::class, 'togglePeriodDay']);
+    Route::patch('/api/period-days/flow', [CycleController::class, 'updatePeriodDayFlow']);
     
     Route::get('/edukasi', function () {
         return view('education');
